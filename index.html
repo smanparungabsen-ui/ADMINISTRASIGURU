@@ -965,6 +965,47 @@
   };
 
   // =========================================================================
+  // FIX UNGGAH BERKAS GAGAL / "Data berkas kosong atau tidak terkirim dengan
+  // sempurna": root cause-nya adalah data base64 berkas yang cukup besar
+  // (modul PDF, lampiran bimbingan) bisa terpotong/gagal terkirim utuh saat
+  // dikirim dalam SATU KALI panggilan ke server. Solusinya: berkas kini
+  // dikirim BERTAHAP dalam potongan-potongan kecil lewat fungsi di bawah ini,
+  // lalu server (uploadFileToDrive di Code.gs) otomatis menggabungkannya
+  // kembali. Fungsi tambahModulDrive, prosesPerbaikiModulDrive, dan
+  // simpanBimbinganWaliServer di server TIDAK diubah -- mekanisme ini hanya
+  // mengganti CARA base64Data dikirim ke fungsi-fungsi tsb.
+  // =========================================================================
+  const UPLOAD_CHUNK_SIZE = 90000; // karakter per potongan, aman di bawah batas 100KB CacheService
+
+  // Membungkus google.script.run (atau versi tiruannya untuk mode hosting terpisah di
+  // bawah) menjadi Promise, supaya bisa dipakai dengan async/await saat mengirim
+  // potongan berkas satu per satu secara berurutan.
+  function gsCall(fnName) {
+      return function() {
+          const args = Array.prototype.slice.call(arguments);
+          return new Promise(function(resolve, reject) {
+              google.script.run.withSuccessHandler(resolve).withFailureHandler(reject)[fnName].apply(null, args);
+          });
+      };
+  }
+
+  // Memecah base64Data menjadi banyak potongan kecil dan mengirimkannya bertahap ke
+  // server. Mengembalikan token "CHUNKED::<id>" yang dipakai menggantikan base64Data
+  // mentah saat memanggil tambahModulDrive / prosesPerbaikiModulDrive /
+  // simpanBimbinganWaliServer seperti biasa.
+  async function unggahBerkasBertahap(base64Data, onProgress) {
+      if (!base64Data) return "";
+      const totalChunks = Math.max(1, Math.ceil(base64Data.length / UPLOAD_CHUNK_SIZE));
+      const uploadId = await gsCall('mulaiUnggahBertahap')(totalChunks);
+      for (let i = 0; i < totalChunks; i++) {
+          const potongan = base64Data.substring(i * UPLOAD_CHUNK_SIZE, (i + 1) * UPLOAD_CHUNK_SIZE);
+          await gsCall('kirimPotonganBerkas')(uploadId, i, potongan);
+          if (onProgress) onProgress(Math.round(((i + 1) / totalChunks) * 100));
+      }
+      return "CHUNKED::" + uploadId;
+  }
+
+  // =========================================================================
   // FUNGSI PENYIMPANAN SESI LOKAL (AUTO-LOGIN)
   // =========================================================================
   function saveSession(userObj) {
@@ -1004,21 +1045,43 @@
           'prosesPerbaikiModulDrive','getSiswaBimbingan','getBimbinganRecords','getAbsenRecords',
           'getLegerDinamis','getAllLegerRaw','getDetailSiswa','getAllSiswaDB','tambahSiswaDB',
           'hapusSiswaDB','tambahGuruDB','hapusGuruDB','tambahBanyakSiswaDB','tambahBanyakGuruDB',
-          'getTautanPortal','simpanTautanPortal','updatePassword','editSiswaDB','editGuruDB'
+          'getTautanPortal','simpanTautanPortal','updatePassword','editSiswaDB','editGuruDB',
+          // FIX UNGGAH BERKAS BERTAHAP: kedua fungsi ini dipakai oleh unggahBerkasBertahap()
+          // di atas supaya mekanisme unggah bertahap juga berjalan saat aplikasi di-hosting
+          // terpisah (Vercel/GitHub Pages), bukan hanya native google.script.run.
+          'mulaiUnggahBertahap','kirimPotonganBerkas'
       ];
 
       // Content-Type "text/plain" SENGAJA dipakai (bukan "application/json") supaya
       // browser mengirim request ini sebagai "simple request" tanpa preflight OPTIONS.
       // Apps Script Web App tidak menangani preflight OPTIONS, jadi kalau memakai
       // application/json, request akan gagal dengan error CORS di semua browser.
-      function callGasApi(action, args) {
+      function callGasApi(action, args, isRetry) {
           return fetch(GAS_API_URL, {
               method: 'POST',
               headers: { 'Content-Type': 'text/plain;charset=utf-8' },
               body: JSON.stringify({ action: action, params: args })
           })
-          .then(function(res) { return res.json(); })
-          .then(function(json) {
+          .then(function(res) { return res.text(); })
+          .then(function(text) {
+              let json;
+              try {
+                  json = JSON.parse(text);
+              } catch (parseErr) {
+                  // FIX: Google Apps Script kadang membalas dengan halaman HTML (bukan
+                  // JSON) saat koneksi terputus sesaat, server Google sedang sibuk, atau
+                  // kuota eksekusi harian akun sedang tinggi. Ini penyebab persis error
+                  // "Unexpected token '<'," yang sering muncul di layar. Alih-alih
+                  // langsung menampilkan error mentah yang membingungkan pengguna,
+                  // sistem otomatis mencoba ulang SEKALI setelah jeda singkat, karena
+                  // kegagalan semacam ini pada umumnya hanya sementara.
+                  if (!isRetry) {
+                      return new Promise(function(resolve) {
+                          setTimeout(function() { resolve(callGasApi(action, args, true)); }, 1200);
+                      });
+                  }
+                  throw new Error("Koneksi ke server Google Apps Script gagal atau server sedang sibuk. Silakan coba lagi beberapa saat.");
+              }
               if (json && json.ok) { return json.result; }
               throw new Error(json && json.error ? json.error : 'Terjadi kesalahan tidak diketahui dari server.');
           });
@@ -1498,7 +1561,7 @@
       if(students.length === 0) {
          html = `<tr><td colspan="2" class="text-center text-muted">Belum ada data siswa di kelas ini.</td></tr>`;
       } else {
-         students.forEach(s => html += `<tr><td class="fw-bold">${safeHTML(s)}</td><td><select class="form-select abs-select shadow-sm border-0 bg-light" data-nama="${safeAttr(s)}"><option>Hadir</option><option>Sakit</option><option>Izin</option><option>Alpa</option><option>Dispen</option></select></td></tr>`);
+         students.forEach(s => html += `<tr><td class="fw-bold">${safeHTML(s)}</td><td><select class="form-select abs-select shadow-sm border-0 bg-light" data-nama="${safeAttr(s)}"><option>Hadir</option><option>Telat</option><option>Sakit</option><option>Izin</option><option>Alpa</option><option>Dispen</option></select></td></tr>`);
       }
       tbody.innerHTML = html;
     }).getSiswaByKelas(kls);
@@ -1553,6 +1616,7 @@
           let headHtml = `<tr>
               <th class="bg-light position-sticky start-0 shadow-sm sortable align-middle" style="z-index: 2; min-width: 180px;" onclick="sortTable('tbl-rekap-absen-result', 0)">Nama Siswa</th>
               <th class="bg-success text-white text-center align-middle" style="min-width:50px;" title="Hadir">H</th>
+              <th class="bg-dark text-white text-center align-middle" style="min-width:50px;" title="Telat">T</th>
               <th class="bg-warning text-dark text-center align-middle" style="min-width:50px;" title="Sakit">S</th>
               <th class="bg-info text-dark text-center align-middle" style="min-width:50px;" title="Izin">I</th>
               <th class="bg-danger text-white text-center align-middle" style="min-width:50px;" title="Alpa">A</th>
@@ -1570,23 +1634,26 @@
 
           let bodyHtml = "";
           students.forEach(siswa => {
-              let h=0, s=0, i=0, a=0, d=0, total=0;
+              let h=0, t=0, s=0, i=0, a=0, d=0, total=0;
               const studentRecords = records.filter(r => r.nama === siswa);
               studentRecords.forEach(r => {
                   total++;
                   if(r.status === 'Hadir') h++;
+                  else if(r.status === 'Telat') t++;
                   else if(r.status === 'Sakit') s++;
                   else if(r.status === 'Izin') i++;
                   else if(r.status === 'Alpa') a++;
                   else if(r.status === 'Dispen') d++;
               });
               
-              let pct = total > 0 ? Math.round(((h + d) / total) * 100) : 0; 
+              // Telat tetap dihitung sebagai kehadiran (siswa tetap datang, hanya terlambat)
+              let pct = total > 0 ? Math.round(((h + d + t) / total) * 100) : 0; 
               let pctColor = pct < 75 ? 'text-danger' : 'text-success';
 
               bodyHtml += `<tr>
                   <td class="fw-bold position-sticky start-0 bg-white shadow-sm" style="z-index: 1;">${safeHTML(siswa)}</td>
                   <td class="text-center fw-bold text-success bg-light">${h}</td>
+                  <td class="text-center fw-bold text-dark bg-light">${t}</td>
                   <td class="text-center fw-bold text-warning bg-light">${s}</td>
                   <td class="text-center fw-bold text-info bg-light">${i}</td>
                   <td class="text-center fw-bold text-danger bg-light">${a}</td>
@@ -1596,7 +1663,7 @@
               dates.forEach(dt => {
                   const rec = studentRecords.find(r => r.tanggal === dt.tanggal && r.pertemuan === dt.pertemuan);
                   if (rec) {
-                      let badge = rec.status==='Hadir' ? 'bg-success' : (rec.status==='Alpa' ? 'bg-danger' : (rec.status==='Dispen' ? 'bg-secondary' : (rec.status==='Izin' ? 'bg-info text-dark' : 'bg-warning text-dark')));
+                      let badge = rec.status==='Hadir' ? 'bg-success' : (rec.status==='Telat' ? 'bg-dark' : (rec.status==='Alpa' ? 'bg-danger' : (rec.status==='Dispen' ? 'bg-secondary' : (rec.status==='Izin' ? 'bg-info text-dark' : 'bg-warning text-dark'))));
                       bodyHtml += `<td class="text-center align-middle" style="cursor:pointer;" onclick="editAbsen(${rec.rowIdx}, '${safeJS(rec.nama)}', '${safeJS(rec.status)}')">
                           <span class="badge ${badge} w-100 py-2">${safeHTML(rec.status)}</span>
                       </td>`;
@@ -1614,7 +1681,7 @@
   function editAbsen(rowIdx, namaSiswa, currentStatus) {
       Swal.fire({
           title: 'Ubah Data Kehadiran',
-          html: `<p class="small mb-3">Siswa: <b>${safeHTML(namaSiswa)}</b></p><select id="swal-edit-absen" class="form-select form-select-lg"><option value="Hadir" ${currentStatus==='Hadir'?'selected':''}>Hadir</option><option value="Sakit" ${currentStatus==='Sakit'?'selected':''}>Sakit</option><option value="Izin" ${currentStatus==='Izin'?'selected':''}>Izin</option><option value="Alpa" ${currentStatus==='Alpa'?'selected':''}>Alpa</option><option value="Dispen" ${currentStatus==='Dispen'?'selected':''}>Dispen</option></select>`,
+          html: `<p class="small mb-3">Siswa: <b>${safeHTML(namaSiswa)}</b></p><select id="swal-edit-absen" class="form-select form-select-lg"><option value="Hadir" ${currentStatus==='Hadir'?'selected':''}>Hadir</option><option value="Telat" ${currentStatus==='Telat'?'selected':''}>Telat</option><option value="Sakit" ${currentStatus==='Sakit'?'selected':''}>Sakit</option><option value="Izin" ${currentStatus==='Izin'?'selected':''}>Izin</option><option value="Alpa" ${currentStatus==='Alpa'?'selected':''}>Alpa</option><option value="Dispen" ${currentStatus==='Dispen'?'selected':''}>Dispen</option></select>`,
           showCancelButton: true, confirmButtonText: '<i class="fas fa-save"></i> Simpan Perubahan'
       }).then(res => {
           if(res.isConfirmed) {
@@ -1805,14 +1872,16 @@
       Swal.fire({
           title: 'Ubah Sesi Penilaian',
           html: `<p class="small text-muted mb-3 text-start">Perubahan berlaku untuk seluruh siswa pada evaluasi <b>${safeHTML(judul)}</b> (${safeHTML(kategori)}).</p>
+                 <div class="text-start mb-2"><label class="small fw-bold text-muted">Judul Penilaian / Bab</label><input type="text" id="swal-sesi-judul-n" class="form-control" value="${safeAttr(judul)}"></div>
                  <div class="text-start mb-2"><label class="small fw-bold text-muted">Tanggal</label><input type="date" id="swal-sesi-tgl-n" class="form-control" value="${safeAttr(oldTanggal)}"></div>
                  <div class="text-start mb-2"><label class="small fw-bold text-muted">Pertemuan / Tugas Ke</label><input type="number" id="swal-sesi-pert-n" class="form-control" value="${safeAttr(oldTugasKe)}"></div>`,
           showCancelButton: true, confirmButtonText: '<i class="fas fa-save"></i> Simpan Perubahan',
           preConfirm: () => {
+              const jdl = document.getElementById("swal-sesi-judul-n").value.trim();
               const tgl = document.getElementById("swal-sesi-tgl-n").value;
               const pert = document.getElementById("swal-sesi-pert-n").value;
-              if(!tgl || !pert) { Swal.showValidationMessage("Tanggal dan Pertemuan wajib diisi!"); return false; }
-              return { tgl, pert };
+              if(!jdl || !tgl || !pert) { Swal.showValidationMessage("Judul, Tanggal, dan Pertemuan wajib diisi!"); return false; }
+              return { jdl, tgl, pert };
           }
       }).then(res => {
           if(res.isConfirmed) {
@@ -1820,7 +1889,7 @@
               const userParam = { role: currentUser.role, nama: currentUser.nama };
               google.script.run.withFailureHandler(errHandler).withSuccessHandler(msg => {
                   Swal.fire("Sukses", msg, "success"); loadRiwayatNilai();
-              }).updateSesiNilai(kelas, mapel, oldTanggal, judul, kategori, res.value.tgl, res.value.pert, userParam);
+              }).updateSesiNilai(kelas, mapel, oldTanggal, judul, kategori, res.value.tgl, res.value.pert, res.value.jdl, userParam);
           }
       });
   }
@@ -2007,9 +2076,22 @@
     const reader = new FileReader();
     Swal.fire({ title: 'Mengunggah Berkas ke Drive...', html: '<p class="small text-muted">Proses ini memakan waktu beberapa saat tergantung dari kecepatan internet & ukuran file Anda.</p>', allowOutsideClick: false, didOpen: () => Swal.showLoading() });
     
-    reader.onload = function(e) { 
-        const base64Data = e.target.result.split(',')[1];
+    // FIX UNGGAH BERKAS GAGAL: base64 mentah dari FileReader sekarang dikirim BERTAHAP
+    // (lihat fungsi unggahBerkasBertahap di atas) sebelum memanggil tambahModulDrive,
+    // supaya tidak lagi terpotong/kosong saat sampai di server untuk berkas berukuran
+    // cukup besar. Fungsi tambahModulDrive itu sendiri TIDAK diubah.
+    reader.onload = async function(e) { 
+        const base64DataMentah = e.target.result.split(',')[1];
         const fileName = nama + " - " + file.name;
+
+        let base64Data;
+        try {
+            base64Data = await unggahBerkasBertahap(base64DataMentah, function(pct) {
+                Swal.update({ title: 'Mengunggah Berkas ke Drive...', html: '<p class="small text-muted">Mengirim data berkas: ' + pct + '%</p>' });
+            });
+        } catch (uploadErr) {
+            return errHandler(uploadErr);
+        }
         
         google.script.run.withFailureHandler(errHandler).withSuccessHandler((msg) => { 
             Swal.fire("Sukses!", msg, "success"); 
@@ -2081,8 +2163,18 @@
         }).then((res) => {
             if(res.isConfirmed) {
                 const file = res.value; const reader = new FileReader(); Swal.fire({ title: 'Memproses Perbaikan...', text: 'Mengunggah revisi ke Drive...', allowOutsideClick: false, didOpen: () => Swal.showLoading() });
-                reader.onload = function(e) { 
-                    const base64Data = e.target.result.split(',')[1];
+                // FIX UNGGAH BERKAS GAGAL: base64 revisi juga dikirim bertahap, sama seperti
+                // unggah modul baru di saveModul() -- lihat komentar di sana untuk detailnya.
+                reader.onload = async function(e) { 
+                    const base64DataMentah = e.target.result.split(',')[1];
+                    let base64Data;
+                    try {
+                        base64Data = await unggahBerkasBertahap(base64DataMentah, function(pct) {
+                            Swal.update({ title: 'Memproses Perbaikan...', html: '<p class="small text-muted">Mengirim data revisi: ' + pct + '%</p>' });
+                        });
+                    } catch (uploadErr) {
+                        return errHandler(uploadErr);
+                    }
                     google.script.run.withFailureHandler(errHandler).withSuccessHandler(msg => { Swal.fire("Sukses", msg, "success"); loadModulTable(); }).prosesPerbaikiModulDrive(idx, nip, namaBerkas, base64Data, file.type, file.name); 
                 }; 
                 reader.readAsDataURL(file);
@@ -2154,8 +2246,18 @@
         if (file.size > 10 * 1024 * 1024) { return Swal.fire("Ukuran Terlalu Besar", "Maksimal ukuran file lampiran adalah 10 MB.", "warning"); }
 
         const reader = new FileReader(); Swal.fire({ title: 'Menyimpan Bimbingan...', text: 'Mengunggah bukti ke Drive...', allowOutsideClick: false, didOpen: () => Swal.showLoading() }); 
-        reader.onload = function(e) { 
-            const base64Data = e.target.result.split(',')[1];
+        // FIX UNGGAH BERKAS GAGAL: lampiran bimbingan juga dikirim bertahap seperti
+        // unggah modul -- lihat komentar di saveModul() untuk detail mekanismenya.
+        reader.onload = async function(e) { 
+            const base64DataMentah = e.target.result.split(',')[1];
+            let base64Data;
+            try {
+                base64Data = await unggahBerkasBertahap(base64DataMentah, function(pct) {
+                    Swal.update({ title: 'Menyimpan Bimbingan...', html: '<p class="small text-muted">Mengunggah bukti ke Drive: ' + pct + '%</p>' });
+                });
+            } catch (uploadErr) {
+                return errHandler(uploadErr);
+            }
             google.script.run.withFailureHandler(errHandler).withSuccessHandler(msg => { 
                 Swal.fire("Sukses", msg, "success"); loadCounselingDashboard(); document.getElementById("wk-file").value = ""; document.getElementById("wk-topik").value = ""; document.getElementById("wk-solusi").value = "";
             }).simpanBimbinganWaliServer(tgl, siswa, kls, jns, top, sol, currentUser.nama, base64Data, file.type, file.name); 
