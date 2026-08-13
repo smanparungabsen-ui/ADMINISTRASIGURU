@@ -994,12 +994,37 @@
   // mentah saat memanggil tambahModulDrive / prosesPerbaikiModulDrive /
   // simpanBimbinganWaliServer seperti biasa.
   async function unggahBerkasBertahap(base64Data, onProgress) {
-      if (!base64Data) return "";
+      // FIX TAMBAHAN: jika berkas yang dipilih ternyata kosong (0 byte) atau gagal
+      // terbaca oleh browser, base64Data akan kosong di titik ini. Sebelumnya kode
+      // hanya mengembalikan string kosong ("") tanpa penjelasan, sehingga server baru
+      // menolaknya belakangan dengan pesan generik "Data berkas kosong...". Sekarang
+      // dihentikan lebih awal di sisi client dengan pesan yang jelas.
+      if (!base64Data) {
+          throw new Error("Berkas yang dipilih kosong (0 byte) atau gagal dibaca oleh browser. Silakan pilih ulang berkas lain.");
+      }
       const totalChunks = Math.max(1, Math.ceil(base64Data.length / UPLOAD_CHUNK_SIZE));
       const uploadId = await gsCall('mulaiUnggahBertahap')(totalChunks);
       for (let i = 0; i < totalChunks; i++) {
           const potongan = base64Data.substring(i * UPLOAD_CHUNK_SIZE, (i + 1) * UPLOAD_CHUNK_SIZE);
-          await gsCall('kirimPotonganBerkas')(uploadId, i, potongan);
+          // FIX TAMBAHAN: kegagalan jaringan sesaat saat mengirim satu potongan (dari
+          // sekian banyak potongan) sebelumnya langsung menggagalkan seluruh proses
+          // unggah. Sekarang tiap potongan dicoba ulang otomatis hingga 3 kali sebelum
+          // benar-benar dianggap gagal, supaya unggah berkas besar lebih tahan terhadap
+          // koneksi yang kurang stabil.
+          let terkirim = false; let lastErr = null;
+          for (let percobaan = 1; percobaan <= 3; percobaan++) {
+              try {
+                  await gsCall('kirimPotonganBerkas')(uploadId, i, potongan);
+                  terkirim = true;
+                  break;
+              } catch (errPotongan) {
+                  lastErr = errPotongan;
+                  if (percobaan < 3) await new Promise(r => setTimeout(r, 800));
+              }
+          }
+          if (!terkirim) {
+              throw new Error("Gagal mengirim potongan berkas ke-" + (i + 1) + " dari " + totalChunks + " setelah beberapa kali percobaan: " + (lastErr && lastErr.message ? lastErr.message : "Koneksi tidak stabil.") + " Silakan coba unggah kembali.");
+          }
           if (onProgress) onProgress(Math.round(((i + 1) / totalChunks) * 100));
       }
       return "CHUNKED::" + uploadId;
@@ -2072,6 +2097,9 @@
     const file = fileInput.files[0]; 
     if (file.type !== "application/pdf" && !file.name.toLowerCase().endsWith('.pdf')) { return Swal.fire("Format Tidak Valid", "Berkas yang diunggah hanya boleh berformat PDF.", "warning"); }
     if (file.size > 10 * 1024 * 1024) { return Swal.fire("Ukuran Terlalu Besar", "Maksimal ukuran file yang diperbolehkan adalah 10 MB.", "warning"); }
+    // FIX TAMBAHAN: berkas 0 byte (kosong/rusak) sebelumnya lolos validasi di sini lalu
+    // baru gagal belakangan di server dengan pesan "Data berkas kosong..." yang membingungkan.
+    if (file.size === 0) { return Swal.fire("Berkas Kosong", "Berkas yang dipilih berukuran 0 byte (kosong/rusak). Silakan pilih berkas PDF lain.", "warning"); }
 
     const reader = new FileReader();
     Swal.fire({ title: 'Mengunggah Berkas ke Drive...', html: '<p class="small text-muted">Proses ini memakan waktu beberapa saat tergantung dari kecepatan internet & ukuran file Anda.</p>', allowOutsideClick: false, didOpen: () => Swal.showLoading() });
@@ -2158,6 +2186,9 @@
                 if(fileInput.files.length === 0) { Swal.showValidationMessage("Pilih berkas terlebih dahulu!"); return false; } 
                 if (fileInput.files[0].type !== "application/pdf" && !fileInput.files[0].name.toLowerCase().endsWith('.pdf')) { Swal.showValidationMessage("Hanya file PDF yang diperbolehkan!"); return false; }
                 if(fileInput.files[0].size > 10 * 1024 * 1024) { Swal.showValidationMessage("Maksimal ukuran file 10 MB!"); return false; }
+                // FIX TAMBAHAN: berkas 0 byte (kosong/rusak) sebelumnya lolos validasi di sini lalu
+                // baru gagal belakangan di server dengan pesan "Data berkas kosong..." yang membingungkan.
+                if (fileInput.files[0].size === 0) { Swal.showValidationMessage("Berkas kosong (0 byte)! Silakan pilih berkas PDF lain."); return false; }
                 return fileInput.files[0]; 
             }
         }).then((res) => {
@@ -2244,6 +2275,9 @@
     if(fileInput.files.length > 0) { 
         const file = fileInput.files[0]; 
         if (file.size > 10 * 1024 * 1024) { return Swal.fire("Ukuran Terlalu Besar", "Maksimal ukuran file lampiran adalah 10 MB.", "warning"); }
+        // FIX TAMBAHAN: berkas 0 byte (kosong/rusak) sebelumnya lolos validasi di sini lalu
+        // baru gagal belakangan di server dengan pesan "Data berkas kosong..." yang membingungkan.
+        if (file.size === 0) { return Swal.fire("Berkas Kosong", "Berkas lampiran yang dipilih berukuran 0 byte (kosong/rusak). Silakan pilih berkas lain.", "warning"); }
 
         const reader = new FileReader(); Swal.fire({ title: 'Menyimpan Bimbingan...', text: 'Mengunggah bukti ke Drive...', allowOutsideClick: false, didOpen: () => Swal.showLoading() }); 
         // FIX UNGGAH BERKAS GAGAL: lampiran bimbingan juga dikirim bertahap seperti
