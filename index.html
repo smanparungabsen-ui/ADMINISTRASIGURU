@@ -965,72 +965,6 @@
   };
 
   // =========================================================================
-  // FIX UNGGAH BERKAS GAGAL / "Data berkas kosong atau tidak terkirim dengan
-  // sempurna": root cause-nya adalah data base64 berkas yang cukup besar
-  // (modul PDF, lampiran bimbingan) bisa terpotong/gagal terkirim utuh saat
-  // dikirim dalam SATU KALI panggilan ke server. Solusinya: berkas kini
-  // dikirim BERTAHAP dalam potongan-potongan kecil lewat fungsi di bawah ini,
-  // lalu server (uploadFileToDrive di Code.gs) otomatis menggabungkannya
-  // kembali. Fungsi tambahModulDrive, prosesPerbaikiModulDrive, dan
-  // simpanBimbinganWaliServer di server TIDAK diubah -- mekanisme ini hanya
-  // mengganti CARA base64Data dikirim ke fungsi-fungsi tsb.
-  // =========================================================================
-  const UPLOAD_CHUNK_SIZE = 90000; // karakter per potongan, aman di bawah batas 100KB CacheService
-
-  // Membungkus google.script.run (atau versi tiruannya untuk mode hosting terpisah di
-  // bawah) menjadi Promise, supaya bisa dipakai dengan async/await saat mengirim
-  // potongan berkas satu per satu secara berurutan.
-  function gsCall(fnName) {
-      return function() {
-          const args = Array.prototype.slice.call(arguments);
-          return new Promise(function(resolve, reject) {
-              google.script.run.withSuccessHandler(resolve).withFailureHandler(reject)[fnName].apply(null, args);
-          });
-      };
-  }
-
-  // Memecah base64Data menjadi banyak potongan kecil dan mengirimkannya bertahap ke
-  // server. Mengembalikan token "CHUNKED::<id>" yang dipakai menggantikan base64Data
-  // mentah saat memanggil tambahModulDrive / prosesPerbaikiModulDrive /
-  // simpanBimbinganWaliServer seperti biasa.
-  async function unggahBerkasBertahap(base64Data, onProgress) {
-      // FIX TAMBAHAN: jika berkas yang dipilih ternyata kosong (0 byte) atau gagal
-      // terbaca oleh browser, base64Data akan kosong di titik ini. Sebelumnya kode
-      // hanya mengembalikan string kosong ("") tanpa penjelasan, sehingga server baru
-      // menolaknya belakangan dengan pesan generik "Data berkas kosong...". Sekarang
-      // dihentikan lebih awal di sisi client dengan pesan yang jelas.
-      if (!base64Data) {
-          throw new Error("Berkas yang dipilih kosong (0 byte) atau gagal dibaca oleh browser. Silakan pilih ulang berkas lain.");
-      }
-      const totalChunks = Math.max(1, Math.ceil(base64Data.length / UPLOAD_CHUNK_SIZE));
-      const uploadId = await gsCall('mulaiUnggahBertahap')(totalChunks);
-      for (let i = 0; i < totalChunks; i++) {
-          const potongan = base64Data.substring(i * UPLOAD_CHUNK_SIZE, (i + 1) * UPLOAD_CHUNK_SIZE);
-          // FIX TAMBAHAN: kegagalan jaringan sesaat saat mengirim satu potongan (dari
-          // sekian banyak potongan) sebelumnya langsung menggagalkan seluruh proses
-          // unggah. Sekarang tiap potongan dicoba ulang otomatis hingga 3 kali sebelum
-          // benar-benar dianggap gagal, supaya unggah berkas besar lebih tahan terhadap
-          // koneksi yang kurang stabil.
-          let terkirim = false; let lastErr = null;
-          for (let percobaan = 1; percobaan <= 3; percobaan++) {
-              try {
-                  await gsCall('kirimPotonganBerkas')(uploadId, i, potongan);
-                  terkirim = true;
-                  break;
-              } catch (errPotongan) {
-                  lastErr = errPotongan;
-                  if (percobaan < 3) await new Promise(r => setTimeout(r, 800));
-              }
-          }
-          if (!terkirim) {
-              throw new Error("Gagal mengirim potongan berkas ke-" + (i + 1) + " dari " + totalChunks + " setelah beberapa kali percobaan: " + (lastErr && lastErr.message ? lastErr.message : "Koneksi tidak stabil.") + " Silakan coba unggah kembali.");
-          }
-          if (onProgress) onProgress(Math.round(((i + 1) / totalChunks) * 100));
-      }
-      return "CHUNKED::" + uploadId;
-  }
-
-  // =========================================================================
   // FUNGSI PENYIMPANAN SESI LOKAL (AUTO-LOGIN)
   // =========================================================================
   function saveSession(userObj) {
@@ -1070,11 +1004,7 @@
           'prosesPerbaikiModulDrive','getSiswaBimbingan','getBimbinganRecords','getAbsenRecords',
           'getLegerDinamis','getAllLegerRaw','getDetailSiswa','getAllSiswaDB','tambahSiswaDB',
           'hapusSiswaDB','tambahGuruDB','hapusGuruDB','tambahBanyakSiswaDB','tambahBanyakGuruDB',
-          'getTautanPortal','simpanTautanPortal','updatePassword','editSiswaDB','editGuruDB',
-          // FIX UNGGAH BERKAS BERTAHAP: kedua fungsi ini dipakai oleh unggahBerkasBertahap()
-          // di atas supaya mekanisme unggah bertahap juga berjalan saat aplikasi di-hosting
-          // terpisah (Vercel/GitHub Pages), bukan hanya native google.script.run.
-          'mulaiUnggahBertahap','kirimPotonganBerkas'
+          'getTautanPortal','simpanTautanPortal','updatePassword','editSiswaDB','editGuruDB'
       ];
 
       // Content-Type "text/plain" SENGAJA dipakai (bukan "application/json") supaya
@@ -2097,29 +2027,13 @@
     const file = fileInput.files[0]; 
     if (file.type !== "application/pdf" && !file.name.toLowerCase().endsWith('.pdf')) { return Swal.fire("Format Tidak Valid", "Berkas yang diunggah hanya boleh berformat PDF.", "warning"); }
     if (file.size > 10 * 1024 * 1024) { return Swal.fire("Ukuran Terlalu Besar", "Maksimal ukuran file yang diperbolehkan adalah 10 MB.", "warning"); }
-    // FIX TAMBAHAN: berkas 0 byte (kosong/rusak) sebelumnya lolos validasi di sini lalu
-    // baru gagal belakangan di server dengan pesan "Data berkas kosong..." yang membingungkan.
-    if (file.size === 0) { return Swal.fire("Berkas Kosong", "Berkas yang dipilih berukuran 0 byte (kosong/rusak). Silakan pilih berkas PDF lain.", "warning"); }
 
     const reader = new FileReader();
     Swal.fire({ title: 'Mengunggah Berkas ke Drive...', html: '<p class="small text-muted">Proses ini memakan waktu beberapa saat tergantung dari kecepatan internet & ukuran file Anda.</p>', allowOutsideClick: false, didOpen: () => Swal.showLoading() });
     
-    // FIX UNGGAH BERKAS GAGAL: base64 mentah dari FileReader sekarang dikirim BERTAHAP
-    // (lihat fungsi unggahBerkasBertahap di atas) sebelum memanggil tambahModulDrive,
-    // supaya tidak lagi terpotong/kosong saat sampai di server untuk berkas berukuran
-    // cukup besar. Fungsi tambahModulDrive itu sendiri TIDAK diubah.
-    reader.onload = async function(e) { 
-        const base64DataMentah = e.target.result.split(',')[1];
+    reader.onload = function(e) { 
+        const base64Data = e.target.result.split(',')[1];
         const fileName = nama + " - " + file.name;
-
-        let base64Data;
-        try {
-            base64Data = await unggahBerkasBertahap(base64DataMentah, function(pct) {
-                Swal.update({ title: 'Mengunggah Berkas ke Drive...', html: '<p class="small text-muted">Mengirim data berkas: ' + pct + '%</p>' });
-            });
-        } catch (uploadErr) {
-            return errHandler(uploadErr);
-        }
         
         google.script.run.withFailureHandler(errHandler).withSuccessHandler((msg) => { 
             Swal.fire("Sukses!", msg, "success"); 
@@ -2186,26 +2100,13 @@
                 if(fileInput.files.length === 0) { Swal.showValidationMessage("Pilih berkas terlebih dahulu!"); return false; } 
                 if (fileInput.files[0].type !== "application/pdf" && !fileInput.files[0].name.toLowerCase().endsWith('.pdf')) { Swal.showValidationMessage("Hanya file PDF yang diperbolehkan!"); return false; }
                 if(fileInput.files[0].size > 10 * 1024 * 1024) { Swal.showValidationMessage("Maksimal ukuran file 10 MB!"); return false; }
-                // FIX TAMBAHAN: berkas 0 byte (kosong/rusak) sebelumnya lolos validasi di sini lalu
-                // baru gagal belakangan di server dengan pesan "Data berkas kosong..." yang membingungkan.
-                if (fileInput.files[0].size === 0) { Swal.showValidationMessage("Berkas kosong (0 byte)! Silakan pilih berkas PDF lain."); return false; }
                 return fileInput.files[0]; 
             }
         }).then((res) => {
             if(res.isConfirmed) {
                 const file = res.value; const reader = new FileReader(); Swal.fire({ title: 'Memproses Perbaikan...', text: 'Mengunggah revisi ke Drive...', allowOutsideClick: false, didOpen: () => Swal.showLoading() });
-                // FIX UNGGAH BERKAS GAGAL: base64 revisi juga dikirim bertahap, sama seperti
-                // unggah modul baru di saveModul() -- lihat komentar di sana untuk detailnya.
-                reader.onload = async function(e) { 
-                    const base64DataMentah = e.target.result.split(',')[1];
-                    let base64Data;
-                    try {
-                        base64Data = await unggahBerkasBertahap(base64DataMentah, function(pct) {
-                            Swal.update({ title: 'Memproses Perbaikan...', html: '<p class="small text-muted">Mengirim data revisi: ' + pct + '%</p>' });
-                        });
-                    } catch (uploadErr) {
-                        return errHandler(uploadErr);
-                    }
+                reader.onload = function(e) { 
+                    const base64Data = e.target.result.split(',')[1];
                     google.script.run.withFailureHandler(errHandler).withSuccessHandler(msg => { Swal.fire("Sukses", msg, "success"); loadModulTable(); }).prosesPerbaikiModulDrive(idx, nip, namaBerkas, base64Data, file.type, file.name); 
                 }; 
                 reader.readAsDataURL(file);
@@ -2275,23 +2176,10 @@
     if(fileInput.files.length > 0) { 
         const file = fileInput.files[0]; 
         if (file.size > 10 * 1024 * 1024) { return Swal.fire("Ukuran Terlalu Besar", "Maksimal ukuran file lampiran adalah 10 MB.", "warning"); }
-        // FIX TAMBAHAN: berkas 0 byte (kosong/rusak) sebelumnya lolos validasi di sini lalu
-        // baru gagal belakangan di server dengan pesan "Data berkas kosong..." yang membingungkan.
-        if (file.size === 0) { return Swal.fire("Berkas Kosong", "Berkas lampiran yang dipilih berukuran 0 byte (kosong/rusak). Silakan pilih berkas lain.", "warning"); }
 
         const reader = new FileReader(); Swal.fire({ title: 'Menyimpan Bimbingan...', text: 'Mengunggah bukti ke Drive...', allowOutsideClick: false, didOpen: () => Swal.showLoading() }); 
-        // FIX UNGGAH BERKAS GAGAL: lampiran bimbingan juga dikirim bertahap seperti
-        // unggah modul -- lihat komentar di saveModul() untuk detail mekanismenya.
-        reader.onload = async function(e) { 
-            const base64DataMentah = e.target.result.split(',')[1];
-            let base64Data;
-            try {
-                base64Data = await unggahBerkasBertahap(base64DataMentah, function(pct) {
-                    Swal.update({ title: 'Menyimpan Bimbingan...', html: '<p class="small text-muted">Mengunggah bukti ke Drive: ' + pct + '%</p>' });
-                });
-            } catch (uploadErr) {
-                return errHandler(uploadErr);
-            }
+        reader.onload = function(e) { 
+            const base64Data = e.target.result.split(',')[1];
             google.script.run.withFailureHandler(errHandler).withSuccessHandler(msg => { 
                 Swal.fire("Sukses", msg, "success"); loadCounselingDashboard(); document.getElementById("wk-file").value = ""; document.getElementById("wk-topik").value = ""; document.getElementById("wk-solusi").value = "";
             }).simpanBimbinganWaliServer(tgl, siswa, kls, jns, top, sol, currentUser.nama, base64Data, file.type, file.name); 
